@@ -10,6 +10,8 @@ from concurrent.futures import ThreadPoolExecutor
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from scipy.spatial import distance
 from sklearn.impute import KNNImputer
+from tensorflow.keras.models import load_model
+
 
 def load_genomic_data(genome_file_path):
     """Load and preprocess SNP data."""
@@ -111,13 +113,115 @@ def process_soil_data(soil_filepath, metadata_filepath):
     return soil_data
 
 def process_weather_data(weather_filepath, metadata_filepath):
+    # Load the data
     weather_data = pd.read_csv(weather_filepath)
     metadata = pd.read_csv(metadata_filepath)
+    daymet_data = pd.read_csv('daymet_data_filtered.csv')
 
+    # Merge weather data and Daymet data on Env and Date
+    merged_data = pd.merge(weather_data, daymet_data, on=["Env", "Date"], how="inner")
 
+    # Calculate the difference between Daymet "tmin (deg c)" and weather "T2M_MIN"
+    merged_data["diff_tmin"] = np.abs(merged_data["tmin (deg c)"] - merged_data["T2M_MIN"])
 
+    # Filter to central 60% of the distribution for each environment (Env)
+    processed_data = []
 
+    for env in merged_data["Env"].unique():
+        env_data = merged_data[merged_data["Env"] == env].copy()
 
+        # Calculate percentiles for central 60%
+        lower_bound = env_data["diff_tmin"].quantile(0.2)
+        upper_bound = env_data["diff_tmin"].quantile(0.8)
+
+        # Filter data within the bounds
+        env_data = env_data[(env_data["diff_tmin"] >= lower_bound) & (env_data["diff_tmin"] <= upper_bound)]
+
+        # Append processed environment data
+        processed_data.append(env_data)
+
+    # Concatenate all processed environments
+    filtered_data = pd.concat(processed_data)
+
+    filtered_data = filtered_data.interpolate(method='linear', limit_direction='both', axis=0)
+    filtered_data = filtered_data.drop(columns=['year','yday','dayl (s)','prcp (mm/day)','srad (W/m^2)','swe (kg/m^2)','tmax (deg c)','tmin (deg c)','vp (Pa)','diff_tmin'])
+
+    filtered_data = filtered_data.groupby('Env', as_index=False).sum()
+
+    return filtered_data
+
+def process_EC_data(EC_data_filepath, metadata_filepath):
+    # Load data
+    EC_data = pd.read_csv(EC_data_filepath)
+    metadata = pd.read_csv(metadata_filepath)
+
+    # Set Env and Year as index to prevent calculations on them
+    EC_data.set_index(['Env'], inplace=True)
+
+    # Define helper function to compute average latitude and longitude of a field
+    def compute_average_coordinates(row):
+        lat_columns = [
+            "Latitude_of_Field_Corner_#1 (lower left)",
+            "Latitude_of_Field_Corner_#2 (lower right)",
+            "Latitude_of_Field_Corner_#3 (upper right)",
+            "Latitude_of_Field_Corner_#4 (upper left)"
+        ]
+        lon_columns = [
+            "Longitude_of_Field_Corner_#1 (lower left)",
+            "Longitude_of_Field_Corner_#2 (lower right)",
+            "Longitude_of_Field_Corner_#3 (upper right)",
+            "Longitude_of_Field_Corner_#4 (upper left)"
+        ]
+        avg_lat = row[lat_columns].dropna().mean()
+        avg_lon = row[lon_columns].dropna().mean()
+        return avg_lat, avg_lon
+
+    # Add average coordinates to metadata
+    metadata[['Avg_Lat', 'Avg_Lon']] = metadata.apply(lambda row: pd.Series(compute_average_coordinates(row)), axis=1)
+
+    # Fill missing average latitude and longitude for environments
+    for idx, row in metadata.iterrows():
+        if pd.isnull(row['Avg_Lat']) or pd.isnull(row['Avg_Lon']):
+            env_name, env_year = row['Env'].rsplit("_", 1)
+            previous_years = metadata[(metadata['Env'].str.startswith(env_name + "_") & metadata['Year'] < int(env_year))]
+            previous_years = previous_years.dropna(subset=['Avg_Lat', 'Avg_Lon']).sort_values('Year', ascending=False)
+            if not previous_years.empty:
+                metadata.at[idx, 'Avg_Lat'] = previous_years.iloc[0]['Avg_Lat']
+                metadata.at[idx, 'Avg_Lon'] = previous_years.iloc[0]['Avg_Lon']
+
+    # Handle missing entries in soil data
+    for idx, row in EC_data.iterrows():
+        if row.isnull().any():
+            # Find corresponding Env and Year in metadata
+            env = idx[0]
+            year = idx[1]
+            field_metadata = metadata[(metadata['Env'] == env) & (metadata['Year'] == year)]
+
+            if not field_metadata.empty:
+                avg_lat, avg_lon = field_metadata.iloc[0][['Avg_Lat', 'Avg_Lon']]
+
+                # Compute distances to other fields
+                metadata['Distance'] = metadata.apply(
+                    lambda r: distance.euclidean((avg_lat, avg_lon), (r['Avg_Lat'], r['Avg_Lon'])), axis=1
+                )
+
+                # Find the 5 closest fields
+                closest_fields = metadata.nsmallest(5, 'Distance')
+
+                # Get soil data for the closest fields
+                closest_soil_data = EC_data[EC_data.index.get_level_values('Env').isin(closest_fields['Env'])]
+
+                # Interpolate missing values across years
+                for col in EC_data.columns:
+                    if pd.isnull(row[col]):
+                        closest_col_values = closest_soil_data.groupby(level='Year')[col].mean()
+                        if not closest_col_values.empty:
+                            EC_data.at[idx, col] = np.interp(
+                                year,
+                                closest_col_values.index,
+                                closest_col_values.values
+                            )
+    return EC_data
 
 def build_encoder(input_dim, latent_dim):
     """Build the encoder part of the VAE."""
@@ -199,89 +303,6 @@ def reconstruction_error(vae, data, output_path="reconstruction_error.png"):
     plt.title('Reconstruction Error Distribution')
     plt.savefig(output_path)
     plt.close()
-
-def merge_training_data():
-    latent_genomic_data = pd.read_csv("latent_space.csv")
-
-    trait_data = pd.read_csv("Training_data/1_Training_Trait_Data_2014_2023.csv")
-    trait_data = trait_data.dropna()
-    trait_data = trait_data.drop(columns=[
-    'Year',
-    'Field_Location',
-    'Experiment',
-    'Replicate',
-    'Block',
-    'Plot',
-    'Range',
-    'Pass',
-    'Hybrid_orig_name',
-    'Hybrid_Parent1',
-    'Hybrid_Parent2',
-    'Plot_Area_ha',
-    'Date_Planted',
-    'Date_Harvested',
-    'Stand_Count_plants',
-    'Pollen_DAP_days',
-    'Silk_DAP_days',
-    'Plant_Height_cm',
-    'Ear_Height_cm',
-    'Root_Lodging_plants',
-    'Stalk_Lodging_plants',
-    'Grain_Moisture',
-    'Twt_kg_m3'
-])
-    print(trait_data)
-
-    training_soil_data = pd.read_csv('Training_data/3_Training_Soil_Data_2015_2023.csv')
-    drop_columns = ["LabID", "Date Received", "Date Reported", "Texture", "Comments"]
-    training_soil_data = training_soil_data.drop(columns=drop_columns)
-    training_soil_data = training_soil_data.iloc[:, :-5]
-    training_soil_data = training_soil_data.interpolate(method='linear', limit_direction='both', axis=0)
-    training_soil_data = training_soil_data.groupby('Env').mean()
-
-    training_weather_data = pd.read_csv('/home/wimahler/Stalk_Overflow/Training_data/4_Training_Weather_Data_2014_2023_full_year.csv')
-    training_weather_data = training_weather_data.drop(columns=['Date'])
-    training_weather_data = training_weather_data.groupby('Env', as_index=False).sum()
-
-    EC_data = pd.read_csv('Training_data/6_Training_EC_Data_2014_2023.csv')
-
-    trainning_merged = pd.merge(trait_data, latent_genomic_data, on='Hybrid')
-    trainning_merged = pd.merge(trainning_merged, training_soil_data, on='Env')
-    trainning_merged = pd.merge(trainning_merged, training_weather_data, on='Env')
-    trainning_merged = pd.merge(trainning_merged, EC_data, on='Env')
-
-    return trainning_merged
-
-def merge_test_data():
-    latent_genomic_data = pd.read_csv("latent_space.csv")
-
-    trait_data = pd.read_csv("Testing_data/1_Submission_Template_2024.csv")
-
-    training_soil_data = pd.read_csv('Testing_data/3_Testing_Soil_Data_2024_imputed.csv')
-    drop_columns = ["LabID", "Date Received", "Date Reported", "Texture", "Comments"]
-    training_soil_data = training_soil_data.drop(columns=drop_columns)
-    training_soil_data = training_soil_data.iloc[:, :-4]
-    training_soil_data = training_soil_data.interpolate(method='linear', limit_direction='both', axis=0)
-    training_soil_data = training_soil_data.groupby('Env').mean()
-
-    training_weather_data = pd.read_csv('Testing_data/4_Testing_Weather_Data_2024_full_year.csv')
-    training_weather_data = training_weather_data.drop(columns=['Date'])
-    training_weather_data = training_weather_data.groupby('Env', as_index=False).sum()
-
-    EC_data = pd.read_csv('Testing_data/6_Testing_EC_Data_2024.csv')
-
-    trainning_merged = pd.merge(trait_data, latent_genomic_data, on='Hybrid')
-    trainning_merged = pd.merge(trainning_merged, training_soil_data, on='Env')
-    trainning_merged = pd.merge(trainning_merged, training_weather_data, on='Env')
-    trainning_merged = pd.merge(trainning_merged, EC_data, on='Env')
-
-    return trainning_merged
-
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-import pandas as pd
 
 def build_feedforward_nn(input_dim):
     """Build a feedforward neural network."""
@@ -446,9 +467,6 @@ def train_nn(data, target_column, test_size=0.3, batch_size=64, epochs=500, k_fo
     plt.savefig(output_plot)
     plt.close()
 
-import numpy as np
-import pandas as pd
-from tensorflow.keras.models import load_model
 
 def predict_yield(testing_merged, model_paths):
     """
@@ -504,7 +522,7 @@ if __name__ == "__main__":
     if mode == 'Training':
         soil_data = process_soil_data(soil_filepath='Training_data/3_Training_Soil_Data_2015_2023.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
         weather_data = process_weather_data(weather_filepath='Training_data/4_Training_Weather_Data_2014_2023_seasons_only.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
-
+        EC_data = process_EC_data(EC_data_filepath='Training_data/6_Training_EC_Data_2014_2023.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
 
         # Load and preprocess the data
         snp_data, index = load_genomic_data(genome_file_path)
@@ -535,11 +553,55 @@ if __name__ == "__main__":
 
         # Train and evaluate the feedforward neural network
 
-        merged_training_df = merge_training_data()
+        latent_genomic_data = pd.read_csv("latent_space.csv")
 
-        train_nn(merged_training_df, target_column="Yield_Mg_ha", output_plot="predicted.png")
+        trait_data = pd.read_csv("Training_data/1_Training_Trait_Data_2014_2023.csv")
+        trait_data = trait_data.dropna()
+        trait_data = trait_data.drop(columns=[
+        'Year',
+        'Field_Location',
+        'Experiment',
+        'Replicate',
+        'Block',
+        'Plot',
+        'Range',
+        'Pass',
+        'Hybrid_orig_name',
+        'Hybrid_Parent1',
+        'Hybrid_Parent2',
+        'Plot_Area_ha',
+        'Date_Planted',
+        'Date_Harvested',
+        'Stand_Count_plants',
+        'Pollen_DAP_days',
+        'Silk_DAP_days',
+        'Plant_Height_cm',
+        'Ear_Height_cm',
+        'Root_Lodging_plants',
+        'Stalk_Lodging_plants',
+        'Grain_Moisture',
+        'Twt_kg_m3'
+        ])
+
+        merged_df = pd.merge(latent_genomic_data, trait_data, on='Hybrid')
+        merged_df = pd.merge(merged_df, weather_data, on='Env')
+        merged_df = pd.merge(merged_df, soil_data, on='Env')
+        merged_df = pd.merge(merged_df, EC_data, on='Env')
+        
+        train_nn(merged_df, target_column="Yield_Mg_ha", output_plot="predicted.png")
 
     if mode == 'Predict':
-        data = merge_test_data()
+        latent_genomic_data = pd.read_csv("latent_space.csv")
+        trait_data = pd.read_csv('Testing_data/1_Submission_Template_2024.csv')
 
-        predict_yield(data, ['model_fold_0.h5', 'model_fold_1.h5', 'model_fold_2.h5', 'model_fold_3.h5', 'model_fold_4.h5'])
+        soil_data = process_soil_data(soil_filepath='Testing_data/3_Testing_Soil_Data_2024_imputed.csv', metadata_filepath='Testing_data/2_Testing_Meta_Data_2024.csv')
+        weather_data = process_weather_data(weather_filepath='Testing_data/4_Testing_Weather_Data_2024_seasons_only.csv', metadata_filepath='Testing_data/2_Testing_Meta_Data_2024.csv')
+        EC_data = process_EC_data(EC_data_filepath='Testing_data/6_Testing_EC_Data_2024.csv', metadata_filepath='Testing_data/2_Testing_Meta_Data_2024.csv')
+
+
+        merged_df = pd.merge(latent_genomic_data, trait_data, on='Hybrid')
+        merged_df = pd.merge(merged_df, weather_data, on='Env')
+        merged_df = pd.merge(merged_df, soil_data, on='Env')
+        merged_df = pd.merge(merged_df, EC_data, on='Env')
+
+        predict_yield(merged_df, ['model_fold_0.h5', 'model_fold_1.h5', 'model_fold_2.h5', 'model_fold_3.h5', 'model_fold_4.h5'])
