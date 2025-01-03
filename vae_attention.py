@@ -1,9 +1,9 @@
 import tensorflow as tf
-from tensorflow.keras import layers, models
+from tensorflow.keras import layers, models, regularizers
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split, KFold, ShuffleSplit
+from sklearn.model_selection import train_test_split, KFold, ShuffleSplit, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +11,7 @@ from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from scipy.spatial import distance
 from sklearn.impute import KNNImputer
 from tensorflow.keras.models import load_model
+from tensorflow.keras.utils import plot_model
 
 
 def load_genomic_data(genome_file_path):
@@ -312,35 +313,92 @@ def split_inputs(data, genomic_columns, weather_columns, soil_columns, EC_column
     yield_data = data["Yield_Mg_ha"].values
     return genomic_data, weather_data, soil_data, EC_data, yield_data
 
+from tensorflow.keras import layers, models, regularizers
+import tensorflow as tf
+
 def build_attention_model(genomic_dim, weather_dim, soil_dim, EC_dim):
     genomic_input = layers.Input(shape=(genomic_dim,), name="Genomic")
     weather_input = layers.Input(shape=(weather_dim,), name="Weather")
     soil_input = layers.Input(shape=(soil_dim,), name="Soil")
     EC_input = layers.Input(shape=(EC_dim,), name="EC")
 
-    genomic_dense = layers.Dense(512, activation="relu")(genomic_input)
-    weather_dense = layers.Dense(512, activation="relu")(weather_input)
-    soil_dense = layers.Dense(512, activation="relu")(soil_input)
-    EC_dense = layers.Dense(512, activation="relu")(EC_input)
+    # Regularization parameters
+    l1_reg = 1e-5
+    l2_reg = 1e-4
 
-    combined = layers.Concatenate()([genomic_dense, weather_dense, soil_dense, EC_dense])
-    reshaped = layers.Reshape((4, 512))(combined)
-    reshaped = layers.BatchNormalization()(reshaped)
+    # Individual pathways with LeakyReLU activation and regularization
+    genomic_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(genomic_input)
+    genomic_dense = layers.LeakyReLU()(genomic_dense)
 
-    attention_output = layers.MultiHeadAttention(num_heads=32, key_dim=32)(reshaped, reshaped)
-    flattened = layers.Flatten()(attention_output)
+    weather_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(weather_input)
+    weather_dense = layers.LeakyReLU()(weather_dense)
 
+    soil_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(soil_input)
+    soil_dense = layers.LeakyReLU()(soil_dense)
+
+    EC_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(EC_input)
+    EC_dense = layers.LeakyReLU()(EC_dense)
+
+    # Cross-stitching: genomic with weather, soil, and EC using Multi-Head Attention
+    # Genomic + Weather
+    stitch_gw = layers.Concatenate()([genomic_dense, weather_dense])
+    stitch_gw = layers.Reshape((1, -1))(stitch_gw)  # Reshape for MultiHeadAttention
+    stitch_gw = layers.MultiHeadAttention(num_heads=4, key_dim=16)(stitch_gw, stitch_gw)
+    stitch_gw = layers.Flatten()(stitch_gw)
+    stitch_gw = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gw)
+    stitch_gw = layers.LeakyReLU()(stitch_gw)
+    stitch_gw = layers.BatchNormalization()(stitch_gw)
+
+    # Genomic + Soil
+    stitch_gs = layers.Concatenate()([genomic_dense, soil_dense])
+    stitch_gs = layers.Reshape((1, -1))(stitch_gs)  # Reshape for MultiHeadAttention
+    stitch_gs = layers.MultiHeadAttention(num_heads=4, key_dim=16)(stitch_gs, stitch_gs)
+    stitch_gs = layers.Flatten()(stitch_gs)
+    stitch_gs = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gs)
+    stitch_gs = layers.LeakyReLU()(stitch_gs)
+    stitch_gs = layers.BatchNormalization()(stitch_gs)
+
+    # Genomic + EC
+    stitch_ge = layers.Concatenate()([genomic_dense, EC_dense])
+    stitch_ge = layers.Reshape((1, -1))(stitch_ge)  # Reshape for MultiHeadAttention
+    stitch_ge = layers.MultiHeadAttention(num_heads=4, key_dim=16)(stitch_ge, stitch_ge)
+    stitch_ge = layers.Flatten()(stitch_ge)
+    stitch_ge = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_ge)
+    stitch_ge = layers.LeakyReLU()(stitch_ge)
+    stitch_ge = layers.BatchNormalization()(stitch_ge)
+
+    # Combine all stitches and pass to final multi-head attention
+    combined_stitch = layers.Concatenate()([stitch_gw, stitch_gs, stitch_ge])
+    combined_stitch = layers.Reshape((3, 64))(combined_stitch)  # Reshape for MultiHeadAttention
+
+    # Final Self-Attention Layer
+    self_attention_output = layers.MultiHeadAttention(num_heads=4, key_dim=16)(combined_stitch, combined_stitch)
+    self_attention_output = layers.LayerNormalization()(self_attention_output + combined_stitch)  # Residual connection
+
+    # Fully connected layers with regularization
+    flattened = layers.Flatten()(self_attention_output)
     x = layers.BatchNormalization()(flattened)
-    x = layers.Dense(2048, activation="relu")(x)
+    x = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(x)
+    x = layers.LeakyReLU()(x)
     x = layers.Dropout(0.2)(x)
-    x = layers.Dense(1024, activation="relu")(x)
-    x = layers.Dropout(0.2)(x)
-    output = layers.Dense(1, name="Yield")(x)
 
-    model = models.Model(inputs=[genomic_input, weather_input, soil_input, EC_input], outputs=output)
-    model.compile(optimizer=tf.keras.optimizers.Adam(), loss="mse", metrics=["mae"])
-    print(model.summary())
+    x = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(x)
+    x = layers.LeakyReLU()(x)
+    x = layers.Dropout(0.2)(x)
+
+    # Output layer
+    outputs = layers.Dense(1, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(x)
+    norm = layers.BatchNormalization()(outputs)
+    outputs = layers.Add()([outputs, norm])
+
+    # Model compilation
+    model = models.Model(inputs=[genomic_input, weather_input, soil_input, EC_input], outputs=outputs)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.005), loss='mse', metrics=["mae"])
+
+    model.summary()
     return model
+
+
 
 def train_attention_model(data, genomic_columns, weather_columns, soil_columns, EC_columns, target_column, 
                           batch_size=1024, epochs=500, k_folds=5, test_size=0.2, output_plot="observed_vs_expected.png"):
@@ -361,13 +419,15 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
     EC_data = scaler_EC.transform(EC_data)
 
     # Train-test split
-    train_idx, test_idx = train_test_split(range(len(genomic_data)), test_size=test_size, random_state=42)
+    train_idx, test_idx = train_test_split(range(len(genomic_data)), test_size=test_size)
     X_train = [genomic_data[train_idx], weather_data[train_idx], soil_data[train_idx], EC_data[train_idx]]
     X_test = [genomic_data[test_idx], weather_data[test_idx], soil_data[test_idx], EC_data[test_idx]]
     y_train, y_test = y[train_idx], y[test_idx]
 
+
     # K-Folds on training data
     kfold = KFold(n_splits=k_folds, shuffle=True)
+    
     models = []
     training_predictions = []
     results = []
@@ -386,8 +446,8 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
             EC_dim=EC_data.shape[1]
         )
 
-        early_stopping = EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True)
-        reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=10, min_lr=1e-6)
+        early_stopping = EarlyStopping(monitor="val_loss", patience=25, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=10, min_lr=1e-7)
 
         history = model.fit(
             X_k_train, y_k_train, validation_data=(X_k_val, y_k_val),
@@ -396,6 +456,8 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
 
         models.append(model)
         model.save(f"attention_model_fold_{fold}.h5")
+
+        plot_model(model, to_file='model_architecture.png', show_shapes=True, show_layer_names=True)
 
         y_k_val_pred = model.predict(X_k_val).flatten()
         r2 = r2_score(y_k_val, y_k_val_pred)
@@ -478,38 +540,40 @@ if __name__ == "__main__":
         EC_data = process_EC_data(EC_data_filepath='Training_data/6_Training_EC_Data_2014_2023.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
 
         # Load and preprocess the data
-        snp_data, index = load_genomic_data(genome_file_path)
+        # snp_data, index = load_genomic_data(genome_file_path)
 
-        # Define dimensions
-        input_dim = snp_data.shape[1]
-        latent_dim = 250  # Adjust based on desired dimensionality
+        # # Define dimensions
+        # input_dim = snp_data.shape[1]
+        # latent_dim = 1000  # Adjust based on desired dimensionality
 
-        # Build the encoder, decoder, and VAE
-        encoder = build_encoder(input_dim, latent_dim)
-        decoder = build_decoder(latent_dim, input_dim)
-        vae = build_vae(encoder, decoder)
+        # # Build the encoder, decoder, and VAE
+        # encoder = build_encoder(input_dim, latent_dim)
+        # decoder = build_decoder(latent_dim, input_dim)
+        # vae = build_vae(encoder, decoder)
 
-        # Train the VAE
-        history = train_vae(vae, snp_data)
+        # # Train the VAE
+        # history = train_vae(vae, snp_data)
 
-        # # Save the encoder for latent space analysis
-        encoder.save("vae_encoder.h5")
+        # # # Save the encoder for latent space analysis
+        # encoder.save("vae_encoder.h5")
 
-        # # Plot training loss
-        plot_training_loss(history)
+        # # # Plot training loss
+        # plot_training_loss(history)
 
-        # # Extract and save latent space representation
-        analyze_latent_space(encoder, snp_data, index)
+        # # # Extract and save latent space representation
+        # analyze_latent_space(encoder, snp_data, index)
 
-        # # Compute and plot reconstruction error
-        reconstruction_error(vae, snp_data)
+        # # # Compute and plot reconstruction error
+        # reconstruction_error(vae, snp_data)
 
         # Train and evaluate the feedforward neural network
 
         latent_genomic_data = pd.read_csv("latent_space.csv")
 
         trait_data = pd.read_csv("Training_data/1_Training_Trait_Data_2014_2023.csv")
-        trait_data = trait_data.dropna()
+        print(np.shape(trait_data))
+        trait_data = trait_data.dropna(subset=['Yield_Mg_ha'])
+        print(np.shape(trait_data))
         trait_data = trait_data.drop(columns=[
         'Year',
         'Field_Location',
