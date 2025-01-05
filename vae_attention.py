@@ -531,7 +531,7 @@ def predict_yield_attention(test_data, model_paths, genomic_columns, weather_col
 
 if __name__ == "__main__":
     # File path to SNP data
-    genome_file_path = "/home/wimahler/Stalk_Overflow/5_Genotype_Data_All_2014_2025_Hybrids_filtered_letters.csv"
+    genome_file_path = "5_Genotype_Data_All_2014_2025_Hybrids_filtered_letters.csv"
 
     mode = 'Predict'
     if mode == 'Training':
