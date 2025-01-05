@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split, KFold, ShuffleSplit, Strat
 from sklearn.metrics import r2_score, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from concurrent.futures import ThreadPoolExecutor
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
 from scipy.spatial import distance
 from sklearn.impute import KNNImputer
 from tensorflow.keras.models import load_model
@@ -324,52 +324,52 @@ def build_attention_model(genomic_dim, weather_dim, soil_dim, EC_dim):
     l2_reg = 1e-4
 
     # Individual pathways with LeakyReLU activation and regularization
-    genomic_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(genomic_input)
+    genomic_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(genomic_input)
     genomic_dense = layers.LeakyReLU()(genomic_dense)
 
-    weather_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(weather_input)
+    weather_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(weather_input)
     weather_dense = layers.LeakyReLU()(weather_dense)
 
-    soil_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(soil_input)
+    soil_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(soil_input)
     soil_dense = layers.LeakyReLU()(soil_dense)
 
-    EC_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(EC_input)
+    EC_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(EC_input)
     EC_dense = layers.LeakyReLU()(EC_dense)
 
     # Cross-stitching: genomic with weather, soil, and EC using Multi-Head Attention
     # Genomic + Weather
     stitch_gw = layers.Concatenate()([genomic_dense, weather_dense])
     stitch_gw = layers.Reshape((1, -1))(stitch_gw)  # Reshape for MultiHeadAttention
-    stitch_gw = layers.MultiHeadAttention(num_heads=2, key_dim=2)(stitch_gw, stitch_gw)
+    stitch_gw = layers.MultiHeadAttention(num_heads=4, key_dim=4)(stitch_gw, stitch_gw)
     stitch_gw = layers.Flatten()(stitch_gw)
-    stitch_gw = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gw)
+    stitch_gw = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gw)
     stitch_gw = layers.LeakyReLU()(stitch_gw)
     stitch_gw = layers.BatchNormalization()(stitch_gw)
 
     # Genomic + Soil
     stitch_gs = layers.Concatenate()([genomic_dense, soil_dense])
     stitch_gs = layers.Reshape((1, -1))(stitch_gs)  # Reshape for MultiHeadAttention
-    stitch_gs = layers.MultiHeadAttention(num_heads=2, key_dim=2)(stitch_gs, stitch_gs)
+    stitch_gs = layers.MultiHeadAttention(num_heads=4, key_dim=4)(stitch_gs, stitch_gs)
     stitch_gs = layers.Flatten()(stitch_gs)
-    stitch_gs = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gs)
+    stitch_gs = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gs)
     stitch_gs = layers.LeakyReLU()(stitch_gs)
     stitch_gs = layers.BatchNormalization()(stitch_gs)
 
     # Genomic + EC
     stitch_ge = layers.Concatenate()([genomic_dense, EC_dense])
     stitch_ge = layers.Reshape((1, -1))(stitch_ge)  # Reshape for MultiHeadAttention
-    stitch_ge = layers.MultiHeadAttention(num_heads=2, key_dim=2)(stitch_ge, stitch_ge)
+    stitch_ge = layers.MultiHeadAttention(num_heads=4, key_dim=4)(stitch_ge, stitch_ge)
     stitch_ge = layers.Flatten()(stitch_ge)
-    stitch_ge = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_ge)
+    stitch_ge = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_ge)
     stitch_ge = layers.LeakyReLU()(stitch_ge)
     stitch_ge = layers.BatchNormalization()(stitch_ge)
 
     # Combine all stitches and pass to final multi-head attention
     combined_stitch = layers.Concatenate()([stitch_gw, stitch_gs, stitch_ge])
-    combined_stitch = layers.Reshape((3, 64))(combined_stitch)  # Reshape for MultiHeadAttention
+    combined_stitch = layers.Reshape((3, 128))(combined_stitch)  # Reshape for MultiHeadAttention
 
     # Final Self-Attention Layer
-    self_attention_output = layers.MultiHeadAttention(num_heads=4, key_dim=4)(combined_stitch, combined_stitch)
+    self_attention_output = layers.MultiHeadAttention(num_heads=8, key_dim=8)(combined_stitch, combined_stitch)
     self_attention_output = layers.LayerNormalization()(self_attention_output + combined_stitch)  # Residual connection
 
     # Fully connected layers with regularization
@@ -396,7 +396,7 @@ def build_attention_model(genomic_dim, weather_dim, soil_dim, EC_dim):
     return model
 
 def train_attention_model(data, genomic_columns, weather_columns, soil_columns, EC_columns, target_column, 
-                          batch_size=2048, epochs=250, k_folds=5, output_plot="observed_vs_expected.png"):
+                          batch_size=2048, epochs=100, k_folds=5, output_plot="observed_vs_expected.png"):
     # Split inputs
     genomic_data, weather_data, soil_data, EC_data, y = split_inputs(data, genomic_columns, weather_columns, soil_columns, EC_columns)
 
@@ -448,9 +448,15 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
         early_stopping = EarlyStopping(monitor="val_loss", patience=25, restore_best_weights=False)
         reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=10, min_lr=1e-7)
 
+        # Directory to save TensorBoard logs
+        log_dir = "logs/fit/" + tf.timestamp().numpy().astype(str)
+
+        # TensorBoard callback
+        tensorboard = TensorBoard(log_dir=log_dir, histogram_freq=1, write_graph=True, write_images=True)
+
         history = model.fit(
             X_k_train, y_k_train, validation_data=(X_k_val, y_k_val),
-            batch_size=batch_size, epochs=epochs, callbacks=[early_stopping, reduce_lr], verbose=1
+            batch_size=batch_size, epochs=epochs, callbacks=[early_stopping, reduce_lr, tensorboard], verbose=1
         )
 
         models.append(model)
