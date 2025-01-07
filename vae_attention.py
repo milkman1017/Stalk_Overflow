@@ -5,13 +5,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split, KFold, ShuffleSplit, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from concurrent.futures import ThreadPoolExecutor
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, TensorBoard
 from scipy.spatial import distance
 from sklearn.impute import KNNImputer
 from tensorflow.keras.models import load_model
 from tensorflow.keras.utils import plot_model
+from keras.preprocessing.text import Tokenizer
+import shap
 
 
 def load_genomic_data(genome_file_path):
@@ -147,7 +149,34 @@ def process_weather_data(weather_filepath, metadata_filepath):
     filtered_data = filtered_data.drop(columns=['year','yday','dayl (s)','prcp (mm/day)','srad (W/m^2)','swe (kg/m^2)','tmax (deg c)','tmin (deg c)','vp (Pa)','diff_tmin', 'Date'])
 
     filtered_data = filtered_data.groupby('Env', as_index=True).sum()
+    
+    T_base = 10 
 
+    # Calculate GDD for each day
+    filtered_data["GDD"] = (
+        (filtered_data["T2M_MAX"] + filtered_data["T2M_MIN"]) / 2 - T_base
+    ).clip(lower=0)  # Ensures no negative GDD values
+
+    # Aggregate GDD by environment
+    aggregated_data = filtered_data.groupby("Env").agg({
+        "RH2M": "mean",  # Relative Humidity
+        "T2M_MAX": "mean",  # Mean max temperature
+        "ALLSKY_SFC_SW_DWN": "sum",  # Total solar radiation
+        "T2MWET": "mean",  # Wet-bulb temperature
+        "GWETTOP": "mean",  # Top-layer soil moisture
+        "QV2M": "mean",  # Specific humidity
+        "GWETPROF": "mean",  # Soil profile moisture
+        "T2M_MIN": "mean",  # Mean min temperature
+        "T2MDEW": "mean",  # Dew point temperature
+        "PS": "mean",  # Surface pressure
+        "T2M": "mean",  # Mean daily temperature
+        "GWETROOT": "mean",  # Root-zone soil moisture
+        "ALLSKY_SFC_PAR_TOT": "sum",  # Total photosynthetically active radiation
+        "WS2M": "mean",  # Mean wind speed
+        "ALLSKY_SFC_SW_DNI": "sum",  # Total direct normal irradiance
+        "PRECTOTCORR": "sum",  # Total precipitation
+        "GDD": "sum",  # Total growing degree days
+    })
 
     return filtered_data
 
@@ -222,6 +251,7 @@ def process_EC_data(EC_data_filepath, metadata_filepath):
                                 closest_col_values.index,
                                 closest_col_values.values
                             )
+
     return EC_data
 
 def build_encoder(input_dim, latent_dim):
@@ -396,12 +426,13 @@ def build_attention_model(genomic_dim, weather_dim, soil_dim, EC_dim):
     return model
 
 def train_attention_model(data, genomic_columns, weather_columns, soil_columns, EC_columns, target_column, 
-                          batch_size=2048, epochs=100, k_folds=5, output_plot="observed_vs_expected.png"):
+                          batch_size=2048, epochs=500, k_folds=2, output_plot="observed_vs_expected.png"):
     # Split inputs
     genomic_data, weather_data, soil_data, EC_data, y = split_inputs(data, genomic_columns, weather_columns, soil_columns, EC_columns)
 
     data = data.set_index(['Hybrid', 'Env', 'Year'])
     env_names = data.index.get_level_values('Env').unique()
+    print(data)
 
     # Standardize inputs
     scaler_genomic = StandardScaler().fit(genomic_data)
@@ -448,27 +479,31 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
         early_stopping = EarlyStopping(monitor="val_loss", patience=25, restore_best_weights=False)
         reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.2, patience=10, min_lr=1e-7)
 
-        # Directory to save TensorBoard logs
-        log_dir = "logs/fit/" + tf.timestamp().numpy().astype(str)
-
-        # TensorBoard callback
-        tensorboard = TensorBoard(log_dir=log_dir, histogram_freq=1, write_graph=True, write_images=True)
-
         history = model.fit(
             X_k_train, y_k_train, validation_data=(X_k_val, y_k_val),
-            batch_size=batch_size, epochs=epochs, callbacks=[early_stopping, reduce_lr, tensorboard], verbose=1
+            batch_size=batch_size, epochs=epochs, callbacks=[early_stopping, reduce_lr], verbose=1
         )
 
         models.append(model)
         model.save(f"attention_model_fold_{fold}.h5")
-
-        plot_model(model, to_file='model_architecture.png', show_shapes=True, show_layer_names=True)
 
         y_k_val_pred = model.predict(X_k_val).flatten()
         r2 = r2_score(y_k_val, y_k_val_pred)
         rmse = mean_squared_error(y_k_val, y_k_val_pred, squared=False)
         print(f"Fold {fold + 1} R^2: {r2:.2f}, RMSE: {rmse:.2f}")
         results.append((fold, r2, rmse))
+
+        # Plot observed vs expected for the current fold
+        plt.figure(figsize=(8, 6))
+        plt.scatter(y_k_train, model.predict(X_k_train).flatten(), color="blue", alpha=0.6, label=f"Training (R^2={r2:.2f}, RMSE={rmse:.2f})", s=3)
+        plt.scatter(y_k_val, y_k_val_pred, color="red", alpha=0.6, label=f"Validation (R^2={r2:.2f}, RMSE={rmse:.2f})", s=5)
+        plt.plot([min(y), max(y)], [min(y), max(y)], color="black", linestyle="--", label="Ideal")
+        plt.xlabel("Observed")
+        plt.ylabel("Predicted")
+        plt.legend()
+        plt.title(f"Fold {fold + 1} Observed vs Predicted")
+        plt.savefig(f"observed_vs_predicted_fold_{fold + 1}.png")
+        plt.close()
 
         # Collect training predictions for observed vs expected plot
         training_predictions.extend((y_k_val, y_k_val_pred))
@@ -514,6 +549,7 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
     plt.savefig(output_plot)
     plt.close()
 
+    print(f"Test R^2: {test_r2:.2f}, RMSE: {test_rmse:.2f}")
     print("Training and evaluation completed.")
 
 
@@ -544,39 +580,40 @@ if __name__ == "__main__":
     genome_file_path = "5_Genotype_Data_All_2014_2025_Hybrids_filtered_letters.csv"
 
     mode = 'Training'
+    vae = False
+
     if mode == 'Training':
         soil_data = process_soil_data(soil_filepath='Training_data/3_Training_Soil_Data_2015_2023.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
         weather_data = process_weather_data(weather_filepath='Training_data/4_Training_Weather_Data_2014_2023_seasons_only.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
         EC_data = process_EC_data(EC_data_filepath='Training_data/6_Training_EC_Data_2014_2023.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
 
-        # Load and preprocess the data
-        snp_data, index = load_genomic_data(genome_file_path)
+        if vae:
+            # Load and preprocess the data
+            snp_data, index = load_genomic_data(genome_file_path)
 
-        # Define dimensions
-        # input_dim = snp_data.shape[1]
-        # latent_dim = 500  # Adjust based on desired dimensionality
+            # Define dimensions
+            input_dim = snp_data.shape[1]
+            latent_dim = 1000  # Adjust based on desired dimensionality
 
-        # # Build the encoder, decoder, and VAE
-        # encoder = build_encoder(input_dim, latent_dim)
-        # decoder = build_decoder(latent_dim, input_dim)
-        # vae = build_vae(encoder, decoder)
+            # Build the encoder, decoder, and VAE
+            encoder = build_encoder(input_dim, latent_dim)
+            decoder = build_decoder(latent_dim, input_dim)
+            vae = build_vae(encoder, decoder)
 
-        # # Train the VAE
-        # history = train_vae(vae, snp_data)
+            # Train the VAE
+            history = train_vae(vae, snp_data)
 
-        # # # Save the encoder for latent space analysis
-        # encoder.save("vae_encoder.h5")
+            # # Save the encoder for latent space analysis
+            encoder.save("vae_encoder.h5")
 
-        # # # Plot training loss
-        # plot_training_loss(history)
+            # # Plot training loss
+            plot_training_loss(history)
 
-        # # # Extract and save latent space representation
-        # analyze_latent_space(encoder, snp_data, index)
+            # # Extract and save latent space representation
+            analyze_latent_space(encoder, snp_data, index)
 
-        # # # Compute and plot reconstruction error
-        # reconstruction_error(vae, snp_data)
-
-        # Train and evaluate the feedforward neural network
+            # # Compute and plot reconstruction error
+            reconstruction_error(vae, snp_data)
 
         latent_genomic_data = pd.read_csv("latent_space.csv")
 
