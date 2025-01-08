@@ -12,8 +12,8 @@ from scipy.spatial import distance
 from sklearn.impute import KNNImputer
 from tensorflow.keras.models import load_model
 from tensorflow.keras.utils import plot_model
-from keras.preprocessing.text import Tokenizer
 import shap
+from sklearn.decomposition import PCA
 
 
 def load_genomic_data(genome_file_path):
@@ -33,12 +33,6 @@ def load_genomic_data(genome_file_path):
     # Apply one-hot encoding to each row
     encoded_data = np.array([one_hot_encode(row) for row in data.values])
     return encoded_data, data.index
-
-from scipy.spatial import distance
-
-import pandas as pd
-from scipy.spatial import distance
-from sklearn.impute import KNNImputer
 
 def process_soil_data(soil_filepath, metadata_filepath):
     # Load data
@@ -178,7 +172,12 @@ def process_weather_data(weather_filepath, metadata_filepath):
         "GDD": "sum",  # Total growing degree days
     })
 
-    return filtered_data
+    return aggregated_data
+
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 def process_EC_data(EC_data_filepath, metadata_filepath):
     # Load data
@@ -252,7 +251,24 @@ def process_EC_data(EC_data_filepath, metadata_filepath):
                                 closest_col_values.values
                             )
 
-    return EC_data
+    # Standardize the data for PCA
+    scaler = StandardScaler()
+    standardized_data = scaler.fit_transform(EC_data)
+
+    n_components=2
+    pca = PCA(n_components=n_components)
+    pca_result = pca.fit_transform(standardized_data)
+
+    # Print variance explained by each principal component
+    variance_explained = pca.explained_variance_ratio_
+    print("Variance explained by each principal component:")
+    for i, variance in enumerate(variance_explained, start=1):
+        print(f"PC{i}: {variance:.4f}")
+
+    # Convert PCA result back to a DataFrame
+    pca_df = pd.DataFrame(pca_result, index=EC_data.index, columns=[f"PC{i}" for i in range(1, n_components+1)])
+
+    return pca_df
 
 def build_encoder(input_dim, latent_dim):
     """Build the encoder part of the VAE."""
@@ -593,7 +609,7 @@ if __name__ == "__main__":
 
             # Define dimensions
             input_dim = snp_data.shape[1]
-            latent_dim = 1000  # Adjust based on desired dimensionality
+            latent_dim = 200 # Adjust based on desired dimensionality
 
             # Build the encoder, decoder, and VAE
             encoder = build_encoder(input_dim, latent_dim)
@@ -621,30 +637,9 @@ if __name__ == "__main__":
         print(np.shape(trait_data))
         trait_data = trait_data.dropna(subset=['Yield_Mg_ha'])
         print(np.shape(trait_data))
-        trait_data = trait_data.drop(columns=[
-        'Field_Location',
-        'Experiment',
-        'Replicate',
-        'Block',
-        'Plot',
-        'Range',
-        'Pass',
-        'Hybrid_orig_name',
-        'Hybrid_Parent1',
-        'Hybrid_Parent2',
-        'Plot_Area_ha',
-        'Date_Planted',
-        'Date_Harvested',
-        'Stand_Count_plants',
-        'Pollen_DAP_days',
-        'Silk_DAP_days',
-        'Plant_Height_cm',
-        'Ear_Height_cm',
-        'Root_Lodging_plants',
-        'Stalk_Lodging_plants',
-        'Grain_Moisture',
-        'Twt_kg_m3'
-        ])
+        trait_data = trait_data.groupby(['Env', 'Hybrid', 'Year'], as_index=False)['Yield_Mg_ha'].mean()
+        print(np.shape(trait_data))
+        print(trait_data)
 
         genomic_columns = latent_genomic_data.columns.drop('Hybrid')
         weather_columns = weather_data.columns
@@ -655,6 +650,7 @@ if __name__ == "__main__":
         merged_df = pd.merge(merged_df, weather_data, on="Env")
         merged_df = pd.merge(merged_df, soil_data, on="Env")
         merged_df = pd.merge(merged_df, EC_data, on="Env")
+        print(merged_df)
 
         train_attention_model(merged_df, genomic_columns, weather_columns, soil_columns, EC_columns, "Yield_Mg_ha")
 
