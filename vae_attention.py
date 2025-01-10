@@ -14,7 +14,7 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.utils import plot_model
 import shap
 from sklearn.decomposition import PCA
-
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 def load_genomic_data(genome_file_path):
     """Load and preprocess SNP data."""
@@ -169,7 +169,7 @@ def process_weather_data(weather_filepath, metadata_filepath):
         "WS2M": "mean",  # Mean wind speed
         "ALLSKY_SFC_SW_DNI": "sum",  # Total direct normal irradiance
         "PRECTOTCORR": "sum",  # Total precipitation
-        "GDD": "sum",  # Total growing degree days
+        # "GDD": "sum",  # Total growing degree days
     })
 
     return aggregated_data
@@ -249,34 +249,40 @@ def process_EC_data(EC_data_filepath, metadata_filepath):
                                 year,
                                 closest_col_values.index,
                                 closest_col_values.values
-                            )
+                            ) 
 
-    # Standardize the data for PCA
-    scaler = StandardScaler()
-    standardized_data = scaler.fit_transform(EC_data)
+    return EC_data
 
-    n_components=2
-    pca = PCA(n_components=n_components)
-    pca_result = pca.fit_transform(standardized_data)
+def preprocess_time_series_data(data, maxlen=None):
+    """Preprocess the time-series data by grouping it by environment and reshaping."""
+    data['Env_Name'] = data.index.str.split('_').str[0]  # Extract the environment name without the year
+    grouped_data = data.groupby('Env_Name')
 
-    # Print variance explained by each principal component
-    variance_explained = pca.explained_variance_ratio_
-    print("Variance explained by each principal component:")
-    for i, variance in enumerate(variance_explained, start=1):
-        print(f"PC{i}: {variance:.4f}")
+    time_series_data = []
+    env_names = []
 
-    # Convert PCA result back to a DataFrame
-    pca_df = pd.DataFrame(pca_result, index=EC_data.index, columns=[f"PC{i}" for i in range(1, n_components+1)])
+    for env, group in grouped_data:
+        group = group.sort_index()  # Ensure data is sorted by year
+        time_series_data.append(group.drop(columns=['Env_Name']).values)  # Exclude 'Env_Name' column
+        env_names.append(env)
 
-    return pca_df
+    # Pad sequences to ensure consistent shape
+    padded_data = pad_sequences(time_series_data, padding="post", dtype="float32", maxlen=maxlen)
+    return padded_data, env_names
 
-def build_encoder(input_dim, latent_dim):
+def build_encoder(input_dim, latent_dim, time_series=False):
     """Build the encoder part of the VAE."""
-    inputs = layers.Input(shape=(input_dim,))
-    x = layers.Dense(1536, activation="relu")(inputs)
-    x = layers.BatchNormalization()(x)  # Add Batch Normalization after the first dense layer
-    x = layers.Dense(1536, activation="relu")(x)
-    x = layers.BatchNormalization()(x)  # Add Batch Normalization after the second dense layer
+    if time_series:
+        inputs = layers.Input(shape=(input_dim[0], input_dim[1]))  # Assuming input_dim=(timesteps, features)
+        x = layers.LSTM(128, return_sequences=True)(inputs)
+        x = layers.LSTM(64, return_sequences=False)(x)
+    else:
+        inputs = layers.Input(shape=(input_dim,))
+        x = layers.Dense(1536, activation="relu")(inputs)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dense(1536, activation="relu")(x)
+        x = layers.BatchNormalization()(x)
+
     z_mean = layers.Dense(latent_dim, name="z_mean")(x)
     z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
 
@@ -290,12 +296,19 @@ def build_encoder(input_dim, latent_dim):
     encoder = models.Model(inputs, [z_mean, z_log_var, z], name="encoder")
     return encoder
 
-def build_decoder(latent_dim, output_dim):
+def build_decoder(latent_dim, output_dim, time_series=False):
     """Build the decoder part of the VAE."""
     latent_inputs = layers.Input(shape=(latent_dim,))
-    x = layers.Dense(1028, activation="relu")(latent_inputs)
-    x = layers.Dense(2048, activation="relu")(x)
-    outputs = layers.Dense(output_dim, activation="sigmoid")(x)
+    if time_series:
+        x = layers.Dense(output_dim[0] * output_dim[1], activation="relu")(latent_inputs)  # Flattened output
+        x = layers.Reshape((output_dim[0], output_dim[1]))(x)  # Reshape to (timesteps, features)
+        x = layers.LSTM(64, return_sequences=True)(x)
+        x = layers.LSTM(128, return_sequences=True)(x)
+        outputs = layers.TimeDistributed(layers.Dense(output_dim[1], activation="sigmoid"))(x)
+    else:
+        x = layers.Dense(1028, activation="relu")(latent_inputs)
+        x = layers.Dense(2048, activation="relu")(x)
+        outputs = layers.Dense(output_dim, activation="sigmoid")(x)
 
     decoder = models.Model(latent_inputs, outputs, name="decoder")
     return decoder
@@ -309,17 +322,24 @@ def build_vae(encoder, decoder):
     def vae_loss(y_true, y_pred):
         reconstruction_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(y_true, y_pred))
         kl_loss = -0.5 * tf.reduce_mean(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-        return reconstruction_loss + kl_loss
+        return tf.abs(reconstruction_loss + kl_loss)
 
     vae = models.Model(inputs, reconstructed, name="vae")
     vae.add_loss(vae_loss(inputs, reconstructed))
     return vae
 
-def train_vae(vae, data, batch_size=1024, epochs=100):
+def train_vae(vae, data, lr, batch_size=1024, epochs=100, time_series=False, maxlen=None):
     """Train the VAE on the provided data."""
-    vae.compile(optimizer=tf.keras.optimizers.Adam())
+
+    vae.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr))
     history = vae.fit(data, data, batch_size=batch_size, epochs=epochs)
     return history
+
+def save_latent_representations(encoder, data, env_names, output_path):
+    """Save the latent representations for each environment."""
+    _, _, z = encoder.predict(data)
+    latent_df = pd.DataFrame(z, index=env_names)
+    latent_df.to_csv(output_path)
 
 def plot_training_loss(history, output_path="training_loss.png"):
     """Plot the training loss over epochs."""
@@ -331,12 +351,14 @@ def plot_training_loss(history, output_path="training_loss.png"):
     plt.savefig(output_path)
     plt.close()
 
-def analyze_latent_space(encoder, data, index, output_path="latent_space.csv"):
+def analyze_latent_space(encoder, data, index, index_name, variable, output_path):
     """Extract and save the latent space representation to a CSV file."""
     z_mean, _, _ = encoder.predict(data)
-    latent_df = pd.DataFrame(z_mean, index=index, columns=[f"z{i+1}" for i in range(z_mean.shape[1])])
-    latent_df.index.name = "Hybrid"
+
+    latent_df = pd.DataFrame(z_mean, index=index, columns=[f"z{i+1}_{variable}" for i in range(z_mean.shape[1])])
+    latent_df.index.name = index_name
     latent_df.to_csv(output_path)
+
     print(f"Latent space representation saved to {output_path}")
 
 def reconstruction_error(vae, data, output_path="reconstruction_error.png"):
@@ -352,11 +374,15 @@ def reconstruction_error(vae, data, output_path="reconstruction_error.png"):
     plt.close()
 
 def split_inputs(data, genomic_columns, weather_columns, soil_columns, EC_columns):
+
+    # Extract input features and the target variable
     genomic_data = data[genomic_columns].values
     weather_data = data[weather_columns].values
     soil_data = data[soil_columns].values
     EC_data = data[EC_columns].values
+    year_data = data["Year"].values  # Include 'Year' as part of the returned dataset
     yield_data = data["Yield_Mg_ha"].values
+
     return genomic_data, weather_data, soil_data, EC_data, yield_data
 
 def build_attention_model(genomic_dim, weather_dim, soil_dim, EC_dim):
@@ -366,66 +392,57 @@ def build_attention_model(genomic_dim, weather_dim, soil_dim, EC_dim):
     EC_input = layers.Input(shape=(EC_dim,), name="EC")
 
     # Regularization parameters
-    l1_reg = 1e-5
-    l2_reg = 1e-4
+    l1_reg = 1e-4
+    l2_reg = 1e-3
 
     # Individual pathways with LeakyReLU activation and regularization
-    genomic_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(genomic_input)
+    genomic_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(genomic_input)
     genomic_dense = layers.LeakyReLU()(genomic_dense)
 
-    weather_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(weather_input)
+    weather_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(weather_input)
     weather_dense = layers.LeakyReLU()(weather_dense)
 
-    soil_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(soil_input)
+    soil_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(soil_input)
     soil_dense = layers.LeakyReLU()(soil_dense)
 
-    EC_dense = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(EC_input)
+    EC_dense = layers.Dense(32, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(EC_input)
     EC_dense = layers.LeakyReLU()(EC_dense)
 
     # Cross-stitching: genomic with weather, soil, and EC using Multi-Head Attention
     # Genomic + Weather
     stitch_gw = layers.Concatenate()([genomic_dense, weather_dense])
-    stitch_gw = layers.Reshape((1, -1))(stitch_gw)  # Reshape for MultiHeadAttention
-    stitch_gw = layers.MultiHeadAttention(num_heads=4, key_dim=4)(stitch_gw, stitch_gw)
-    stitch_gw = layers.Flatten()(stitch_gw)
-    stitch_gw = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gw)
+    stitch_gw = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gw)
     stitch_gw = layers.LeakyReLU()(stitch_gw)
     stitch_gw = layers.BatchNormalization()(stitch_gw)
 
     # Genomic + Soil
     stitch_gs = layers.Concatenate()([genomic_dense, soil_dense])
-    stitch_gs = layers.Reshape((1, -1))(stitch_gs)  # Reshape for MultiHeadAttention
-    stitch_gs = layers.MultiHeadAttention(num_heads=4, key_dim=4)(stitch_gs, stitch_gs)
-    stitch_gs = layers.Flatten()(stitch_gs)
-    stitch_gs = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gs)
+    stitch_gs = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_gs)
     stitch_gs = layers.LeakyReLU()(stitch_gs)
     stitch_gs = layers.BatchNormalization()(stitch_gs)
 
     # Genomic + EC
     stitch_ge = layers.Concatenate()([genomic_dense, EC_dense])
-    stitch_ge = layers.Reshape((1, -1))(stitch_ge)  # Reshape for MultiHeadAttention
-    stitch_ge = layers.MultiHeadAttention(num_heads=4, key_dim=4)(stitch_ge, stitch_ge)
-    stitch_ge = layers.Flatten()(stitch_ge)
-    stitch_ge = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_ge)
+    stitch_ge = layers.Dense(64, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(stitch_ge)
     stitch_ge = layers.LeakyReLU()(stitch_ge)
     stitch_ge = layers.BatchNormalization()(stitch_ge)
 
     # Combine all stitches and pass to final multi-head attention
     combined_stitch = layers.Concatenate()([stitch_gw, stitch_gs, stitch_ge])
-    combined_stitch = layers.Reshape((3, 128))(combined_stitch)  # Reshape for MultiHeadAttention
+    combined_stitch = layers.Reshape((3, 64))(combined_stitch)  # Reshape for MultiHeadAttention
 
     # Final Self-Attention Layer
-    self_attention_output = layers.MultiHeadAttention(num_heads=8, key_dim=8)(combined_stitch, combined_stitch)
+    self_attention_output = layers.MultiHeadAttention(num_heads=2, key_dim=2)(combined_stitch, combined_stitch)
     self_attention_output = layers.LayerNormalization()(self_attention_output + combined_stitch)  # Residual connection
 
     # Fully connected layers with regularization
     flattened = layers.Flatten()(self_attention_output)
     x = layers.BatchNormalization()(flattened)
-    x = layers.Dense(512, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(x)
+    x = layers.Dense(256, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(x)
     x = layers.LeakyReLU()(x)
     x = layers.Dropout(0.2)(x)
 
-    x = layers.Dense(256, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(x)
+    x = layers.Dense(128, kernel_regularizer=regularizers.L1L2(l1=l1_reg, l2=l2_reg))(x)
     x = layers.LeakyReLU()(x)
     x = layers.Dropout(0.2)(x)
 
@@ -436,19 +453,18 @@ def build_attention_model(genomic_dim, weather_dim, soil_dim, EC_dim):
 
     # Model compilation
     model = models.Model(inputs=[genomic_input, weather_input, soil_input, EC_input], outputs=outputs)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.005), loss='mse', metrics=["mae"])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005), loss='mse', metrics=["mae"])
 
     model.summary()
     return model
 
 def train_attention_model(data, genomic_columns, weather_columns, soil_columns, EC_columns, target_column, 
-                          batch_size=2048, epochs=500, k_folds=2, output_plot="observed_vs_expected.png"):
+                          batch_size=2048, epochs=500, k_folds=5, output_plot="observed_vs_expected.png"):
     # Split inputs
     genomic_data, weather_data, soil_data, EC_data, y = split_inputs(data, genomic_columns, weather_columns, soil_columns, EC_columns)
 
     data = data.set_index(['Hybrid', 'Env', 'Year'])
     env_names = data.index.get_level_values('Env').unique()
-    print(data)
 
     # Standardize inputs
     scaler_genomic = StandardScaler().fit(genomic_data)
@@ -475,7 +491,7 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
     
     models = []
     training_predictions = []
-    training_envs = data.index[train_idx].get_level_values('Env')
+
     results = []
 
     for fold, (k_train_idx, k_val_idx) in enumerate(kfold.split(X_train[0])):
@@ -568,7 +584,6 @@ def train_attention_model(data, genomic_columns, weather_columns, soil_columns, 
     print(f"Test R^2: {test_r2:.2f}, RMSE: {test_rmse:.2f}")
     print("Training and evaluation completed.")
 
-
 def predict_yield_attention(test_data, model_paths, genomic_columns, weather_columns, soil_columns, EC_columns):
     genomic_data, weather_data, soil_data, EC_data, _ = split_inputs(test_data, genomic_columns, weather_columns, soil_columns, EC_columns)
 
@@ -596,61 +611,74 @@ if __name__ == "__main__":
     genome_file_path = "5_Genotype_Data_All_2014_2025_Hybrids_filtered_letters.csv"
 
     mode = 'Training'
-    vae = False
 
     if mode == 'Training':
         soil_data = process_soil_data(soil_filepath='Training_data/3_Training_Soil_Data_2015_2023.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
         weather_data = process_weather_data(weather_filepath='Training_data/4_Training_Weather_Data_2014_2023_seasons_only.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
         EC_data = process_EC_data(EC_data_filepath='Training_data/6_Training_EC_Data_2014_2023.csv', metadata_filepath='Training_data/2_Training_Meta_Data_2014_2023.csv')
 
-        if vae:
-            # Load and preprocess the data
-            snp_data, index = load_genomic_data(genome_file_path)
+        # Load and preprocess the data
+        snp_data, index = load_genomic_data(genome_file_path)
 
-            # Define dimensions
-            input_dim = snp_data.shape[1]
-            latent_dim = 200 # Adjust based on desired dimensionality
+        # Define dimensions
+        input_dim = snp_data.shape[1]
+        latent_dim = 5000 # Adjust based on desired dimensionality
+
+        # Build the encoder, decoder, and VAE
+        encoder = build_encoder(input_dim, latent_dim)
+        decoder = build_decoder(latent_dim, input_dim)
+        vae = build_vae(encoder, decoder)
+        train_vae(vae, snp_data, lr=0.001)
+        analyze_latent_space(encoder, snp_data, index, "Hybrid", "genomic", "genomic_latent_space.csv")
+
+        latent_genomic_data = pd.read_csv("genomic_latent_space.csv")
+
+        trait_data = pd.read_csv("Training_data/1_Training_Trait_Data_2014_2023.csv")
+
+        trait_data = trait_data.dropna(subset=['Yield_Mg_ha'])
+
+        trait_data = trait_data.groupby(['Env', 'Hybrid', 'Year'], as_index=False)['Yield_Mg_ha'].mean()
+
+        environmental_variables = ['weather', 'soil', 'EC']
+        environmental_data = [weather_data, soil_data, EC_data]
+
+        for variable, data in zip(environmental_variables, environmental_data):
+            # Preprocess the data and get the padded sequences and environment names
+            processed_data, env_names = preprocess_time_series_data(data)
+            processed_data = tf.convert_to_tensor(processed_data)  # Ensure 3D shape for LSTM
+
+            # Define the input dimensions for the encoder and decoder
+            input_dim = processed_data.shape[1:]  # (timesteps, features)
+            latent_dim = 1000
 
             # Build the encoder, decoder, and VAE
-            encoder = build_encoder(input_dim, latent_dim)
-            decoder = build_decoder(latent_dim, input_dim)
+            encoder = build_encoder(input_dim, latent_dim, time_series=True)
+            decoder = build_decoder(latent_dim, input_dim, time_series=True)
             vae = build_vae(encoder, decoder)
 
             # Train the VAE
-            history = train_vae(vae, snp_data)
+            history = train_vae(vae, processed_data, lr=0.0001, time_series=True)
 
-            # # Save the encoder for latent space analysis
-            encoder.save("vae_encoder.h5")
+            # Save latent representations
+            output_path = f'{variable}_latent_space.csv'
+            # save_latent_representations(encoder, processed_data, env_names, output_path)
+            analyze_latent_space(encoder, processed_data, env_names, "Env", variable, output_path)
 
-            # # Plot training loss
-            plot_training_loss(history)
-
-            # # Extract and save latent space representation
-            analyze_latent_space(encoder, snp_data, index)
-
-            # # Compute and plot reconstruction error
-            reconstruction_error(vae, snp_data)
-
-        latent_genomic_data = pd.read_csv("latent_space.csv")
-
-        trait_data = pd.read_csv("Training_data/1_Training_Trait_Data_2014_2023.csv")
-        print(np.shape(trait_data))
-        trait_data = trait_data.dropna(subset=['Yield_Mg_ha'])
-        print(np.shape(trait_data))
-        trait_data = trait_data.groupby(['Env', 'Hybrid', 'Year'], as_index=False)['Yield_Mg_ha'].mean()
-        print(np.shape(trait_data))
-        print(trait_data)
+        weather_data = pd.read_csv('weather_latent_space.csv')
+        soil_data = pd.read_csv('soil_latent_space.csv')
+        EC_data = pd.read_csv('EC_latent_space.csv')
 
         genomic_columns = latent_genomic_data.columns.drop('Hybrid')
-        weather_columns = weather_data.columns
-        soil_columns = soil_data.columns
-        EC_columns = EC_data.columns
+        weather_columns = weather_data.columns.drop('Env')
+        soil_columns = soil_data.columns.drop('Env')
+        EC_columns = EC_data.columns.drop('Env')
+
+        trait_data['Env'] = trait_data['Env'].str.split('_').str[0]
 
         merged_df = pd.merge(latent_genomic_data, trait_data, on="Hybrid")
         merged_df = pd.merge(merged_df, weather_data, on="Env")
         merged_df = pd.merge(merged_df, soil_data, on="Env")
         merged_df = pd.merge(merged_df, EC_data, on="Env")
-        print(merged_df)
 
         train_attention_model(merged_df, genomic_columns, weather_columns, soil_columns, EC_columns, "Yield_Mg_ha")
 
